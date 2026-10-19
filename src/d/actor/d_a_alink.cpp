@@ -5115,6 +5115,12 @@ int daAlink_c::create() {
     #endif
 
     fopAcM_create(fpcNm_MIDNA_e, midna_prm, &current.pos, fopAcM_GetRoomNo(this), &shape_angle, NULL, -1);
+
+#if TARGET_PC
+    // Link's cape: the same cloak actor Ganondorf uses, parented to Link (see d_a_mant.cpp).
+    // TODO: hide it in wolf form and during cutscenes where it looks wrong.
+    fopAcM_createChild(fpcNm_MANT_e, fopAcM_GetID(this), 0, &current.pos, fopAcM_GetRoomNo(this), NULL, NULL, -1, 0);
+#endif
     checkSetNpcTks(&current.pos, fopAcM_GetRoomNo(this), 1);
 
     if (startPoint == -4 && dComIfGp_TargetWarpPt_get() != 0xFF && !dComIfGp_TransportWarp_check()) {

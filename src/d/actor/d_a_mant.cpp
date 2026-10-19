@@ -8,6 +8,7 @@
 #include "d/actor/d_a_mant.h"
 #include "JSystem/J3DGraphBase/J3DDrawBuffer.h"
 #include "d/actor/d_a_b_gnd.h"
+#include "d/actor/d_a_alink.h"
 #include "d/d_com_inf_game.h"
 
 #if TARGET_PC
@@ -72,6 +73,59 @@ static bool textureObjsInitialized = false;
 static TGXTlutObj tlutObj;
 static TGXTexObj mainTexObj;
 static TGXTexObj undersideTexObj;
+
+// ---------------------------------------------------------------------------------------------
+// Link's cape variant.
+// Link's cape gets its own copies of the texture and palette and its own GX texture objects, so
+// Ganondorf's cape (tears, palette refreshes, replacement detection) and Link's never touch each
+// other. The palette copy has the lowest bit of every entry flipped: visually identical, but the
+// replacement-texture hash differs, so a texture pack can target Link's cape only.
+// ---------------------------------------------------------------------------------------------
+static u8 l_LinkMantTEX[0x4000];
+static u8 l_LinkMantTEX_U[0x4000];
+static u8 l_LinkMantPAL[0x60];
+static bool linkTexturesPrepared = false;
+static bool linkTextureObjsInitialized = false;
+static TGXTlutObj linkTlutObj;
+static TGXTexObj linkMainTexObj;
+static TGXTexObj linkUndersideTexObj;
+
+static void mant_prepare_link_textures() {
+    if (linkTexturesPrepared) {
+        return;
+    }
+    memcpy(l_LinkMantTEX, l_Egnd_mantTEX, sizeof(l_LinkMantTEX));
+    memset(l_LinkMantTEX_U, 6, sizeof(l_LinkMantTEX_U));
+    memcpy(l_LinkMantPAL, l_Egnd_mantPAL, sizeof(l_LinkMantPAL));
+    for (int i = 1; i < 0x60; i += 2) {
+        l_LinkMantPAL[i] ^= 1;  // low byte of each big-endian RGB5A3 entry: blue LSB
+    }
+    linkTexturesPrepared = true;
+}
+
+// Where the cape hangs on Link. Offsets are in backbone2's local space (X is probably along the
+// spine, Z probably left/right, as on Ganondorf's shoulder pads). These are STARTING GUESSES:
+// tune them in game. If the cape is on his chest, flip the sign of l_linkCapeBack; if it hangs
+// inside out, swap the two anchors.
+#define LINK_CAPE_JOINT 2  // backbone2
+static f32 l_linkCapeUp = 6.0f;
+static f32 l_linkCapeBack = -12.0f;
+static f32 l_linkCapeHalfWidth = 17.0f;
+
+static daAlink_c* mant_get_link_parent(mant_class* m) {
+    fopAc_ac_c* p = (fopAc_ac_c*)fopAcM_SearchByID(m->parentActorID);
+    return (p != NULL && fopAcM_GetName(p) == fpcNm_ALINK_e) ? (daAlink_c*)p : NULL;
+}
+
+static void mant_link_anchors(MtxP joint, cXyz* a, cXyz* b) {
+    cXyz off;
+    MTXCopy(joint, *calc_mtx);
+    off.set(l_linkCapeUp, l_linkCapeBack, -l_linkCapeHalfWidth);
+    MtxPosition(&off, a);
+    MTXCopy(joint, *calc_mtx);
+    off.set(l_linkCapeUp, l_linkCapeBack, l_linkCapeHalfWidth);
+    MtxPosition(&off, b);
+}
 
 // l_pos is unused
 // DEFINE_MANT_ASSET(l_pos, f32, 507, {
@@ -163,8 +217,15 @@ static void mant_build_anchor_frame(const cXyz& anchor_a, const cXyz& anchor_b, 
 void daMant_packet_c::draw() {
     ZoneScoped;
 #if TARGET_PC
-    void* image = l_Egnd_mantTEX_copy;
-    void* lut = l_Egnd_mantPAL;
+    mant_class* owner = reinterpret_cast<mant_class*>(reinterpret_cast<u8*>(this) - offsetof(mant_class, field_0x0570));
+    const bool isLink = owner->mIsLink != 0;
+    void* image = isLink ? (void*)l_LinkMantTEX : (void*)l_Egnd_mantTEX_copy;
+    void* lut = isLink ? (void*)l_LinkMantPAL : (void*)l_Egnd_mantPAL;
+    void* underImage = isLink ? (void*)l_LinkMantTEX_U : (void*)l_Egnd_mantTEX_U;
+    TGXTlutObj& tlut = isLink ? linkTlutObj : tlutObj;
+    TGXTexObj& mainTex = isLink ? linkMainTexObj : mainTexObj;
+    TGXTexObj& underTex = isLink ? linkUndersideTexObj : undersideTexObj;
+    bool& objsInit = isLink ? linkTextureObjsInitialized : textureObjsInitialized;
 #else
     void* image = tex_d[0];
     void* lut = pal_d;
@@ -204,7 +265,19 @@ void daMant_packet_c::draw() {
 
         mant_class* mant_p = reinterpret_cast<mant_class*>(reinterpret_cast<u8*>(this) - offsetof(mant_class, field_0x0570));
         if (mant_p != NULL) {
-            b_gnd_class* parent = (b_gnd_class*)fopAcM_SearchByID(mant_p->parentActorID);
+            if (mant_p->mIsLink) {
+                daAlink_c* link = mant_get_link_parent(mant_p);
+                if (link != NULL && link->mpLinkModel != NULL) {
+                    MtxP link_src = link->mpLinkModel->getAnmMtx(LINK_CAPE_JOINT);
+                    Mtx link_scratch;
+                    MtxP link_jnt = dusk::interp::lookup_replacement(link_src, link_scratch) ? link_scratch : link_src;
+                    cXyz link_a;
+                    cXyz link_b;
+                    mant_link_anchors(link_jnt, &link_a, &link_b);
+                    mant_build_anchor_frame(link_a, link_b, presented_frame);
+                }
+            }
+            b_gnd_class* parent = mant_p->mIsLink ? NULL : (b_gnd_class*)fopAcM_SearchByID(mant_p->parentActorID);
             if (parent != NULL && parent->mpModelMorf != NULL) {
                 J3DModel* model = parent->mpModelMorf->getModel();
                 if (model != NULL) {
@@ -276,15 +349,17 @@ void daMant_packet_c::draw() {
     GXSetAlphaCompare(GX_GREATER, 0, GX_AOP_OR, GX_GREATER, 0);
 
 #if TARGET_PC
-    if (!textureObjsInitialized) {
-        GXInitTlutObj(&tlutObj, lut, GX_TL_RGB5A3, 0x100);
-        GXInitTexObjCI(&mainTexObj, image, 0x80, 0x80, GX_TF_C8, GX_CLAMP, GX_CLAMP, 0, 0);
-        GXInitTexObjLOD(&mainTexObj, GX_LINEAR, GX_LINEAR, 0.0, 0.0, 0.0, 0, 0, GX_ANISO_1);
+    if (!objsInit) {
+        GXInitTlutObj(&tlut, lut, GX_TL_RGB5A3, 0x100);
+        GXInitTexObjCI(&mainTex, image, 0x80, 0x80, GX_TF_C8, GX_CLAMP, GX_CLAMP, 0, 0);
+        GXInitTexObjLOD(&mainTex, GX_LINEAR, GX_LINEAR, 0.0, 0.0, 0.0, 0, 0, GX_ANISO_1);
         GXInitTexObjCI(
-            &undersideTexObj, l_Egnd_mantTEX_U, 0x80, 0x80, GX_TF_C8, GX_CLAMP, GX_CLAMP, 0, 0);
-        GXInitTexObjLOD(&undersideTexObj, GX_LINEAR, GX_LINEAR, 0.0, 0.0, 0.0, 0, 0, GX_ANISO_1);
-        l_Egnd_mantTEX_hasReplacement = aurora::texture::has_replacement(&mainTexObj, &tlutObj);
-        textureObjsInitialized = true;
+            &underTex, underImage, 0x80, 0x80, GX_TF_C8, GX_CLAMP, GX_CLAMP, 0, 0);
+        GXInitTexObjLOD(&underTex, GX_LINEAR, GX_LINEAR, 0.0, 0.0, 0.0, 0, 0, GX_ANISO_1);
+        if (!isLink) {
+            l_Egnd_mantTEX_hasReplacement = aurora::texture::has_replacement(&mainTex, &tlut);
+        }
+        objsInit = true;
     }
 #else
     GXTlutObj GStack_80;
@@ -296,8 +371,8 @@ void daMant_packet_c::draw() {
 #endif
 
 #if TARGET_PC
-    GXLoadTlut(&tlutObj, GX_TLUT0);
-    GXLoadTexObj(&mainTexObj, GX_TEXMAP0);
+    GXLoadTlut(&tlut, GX_TLUT0);
+    GXLoadTexObj(&mainTex, GX_TEXMAP0);
 #else
     GXLoadTlut(&GStack_80, GX_TLUT0);
     GXLoadTexObj(&GStack_74, GX_TEXMAP0);
@@ -318,7 +393,7 @@ void daMant_packet_c::draw() {
     GXCallDisplayList(l_Egnd_mantDL, 0x3e0);
 
 #if TARGET_PC
-    GXLoadTexObj(&undersideTexObj, GX_TEXMAP0);
+    GXLoadTexObj(&underTex, GX_TEXMAP0);
 #else
     GXInitTexObjCI(&GStack_74, l_Egnd_mantTEX_U, 0x80, 0x80, GX_TF_C8, GX_CLAMP, GX_CLAMP, 0, 0);
     GXInitTexObjLOD(&GStack_74, GX_LINEAR, GX_LINEAR, 0.0, 0.0, 0.0, 0, 0, GX_ANISO_1);
@@ -340,7 +415,12 @@ void daMant_packet_c::draw() {
     GXLoadNrmMtxImm(MStack_54, GX_PNMTX0);
     GXCallDisplayList(l_Egnd_mantDL, 0x3e0);
 
+#if TARGET_PC
+    // per-cape parity: the old shared counter flips twice per frame once two capes exist
+    this->field_0x74 = owner->field_0x25a0 & 1;
+#else
     this->field_0x74 = lbl_277_bss_0 & 1;
+#endif
     J3DShape::resetVcdVatCache();
 }
 
@@ -384,7 +464,7 @@ static void joint_control(mant_class* i_this, mant_j_s* param_2, int param_3, f3
     cXyz spD8;
     Vec spCC;
 
-    b_gnd_class* gndActor = (b_gnd_class*)fopAcM_SearchByID(mant_sp38->parentActorID);
+    b_gnd_class* gndActor = mant_sp38->mIsLink ? NULL : (b_gnd_class*)fopAcM_SearchByID(mant_sp38->parentActorID);
 
     f32 var_f31;
     f32 var_f30;
@@ -396,7 +476,7 @@ static void joint_control(mant_class* i_this, mant_j_s* param_2, int param_3, f3
     f32 sp18;
     f32 sp14;
 
-    if (gndActor->mDrawHorse != 0) {
+    if (gndActor != NULL && gndActor->mDrawHorse != 0) {
         sp20 = TRUE;
         spD8 = gndActor->field_0x1fb8;
     } else if (i_this->field_0x3966 != 0) {
@@ -666,7 +746,29 @@ static int daMant_Execute(mant_class* i_this) {
         i_this->field_0x399e--;
     }
 
-    b_gnd_class* gndActor = (b_gnd_class*)fopAcM_SearchByID(mant_actor->parentActorID);
+    b_gnd_class* gndActor = i_this->mIsLink ? NULL : (b_gnd_class*)fopAcM_SearchByID(mant_actor->parentActorID);
+
+    if (i_this->mIsLink) {
+        // Ganondorf's own code feeds the anchors for his cape; for Link's cape we feed them here.
+        daAlink_c* link = mant_get_link_parent(i_this);
+        if (link != NULL && link->mpLinkModel != NULL) {
+            cXyz anchor_a;
+            cXyz anchor_b;
+            mant_link_anchors(link->mpLinkModel->getAnmMtx(LINK_CAPE_JOINT), &anchor_a, &anchor_b);
+            i_this->field_0x3928[0] = anchor_a;
+            i_this->field_0x3928[1] = anchor_b;
+            mant_actor->current.pos = link->current.pos;
+
+            // billow with run speed (the value decays on its own each frame)
+            f32 billow = link->speedF * (1.0f / 20.0f);
+            if (billow > 1.0f) {
+                billow = 1.0f;
+            }
+            if (billow > i_this->field_0x395c) {
+                i_this->field_0x395c = billow;
+            }
+        }
+    }
 
     if (gndActor && gndActor->mDrawHorse != 0) {
         i_this->field_0x394c = 21.0f;
@@ -824,15 +926,28 @@ static int daMant_Create(fopAc_ac_c* i_this) {
     m_this->field_0x3958 = -10.0f;
     m_this->scale.set(1.0f, 1.0f, 1.0f);
 
-    for (int i = 0; i < 0x4000; i++) {
-        l_Egnd_mantTEX_U[i] = 6;
+    m_this->mIsLink = 0;
+#if TARGET_PC
+    m_this->mIsLink = (mant_get_link_parent(m_this) != NULL) ? 1 : 0;
+#endif
+
+    // Ganondorf's cape owns the shared texture state; a Link cape must never reset it
+    // (e.g. respawning mid-fight would otherwise erase Ganondorf's tears).
+    if (!m_this->mIsLink) {
+        for (int i = 0; i < 0x4000; i++) {
+            l_Egnd_mantTEX_U[i] = 6;
+        }
     }
 
 #if TARGET_PC
-    memcpy(l_Egnd_mantTEX_copy, l_Egnd_mantTEX, sizeof(l_Egnd_mantTEX_copy));
+    if (m_this->mIsLink) {
+        mant_prepare_link_textures();
+    } else {
+        memcpy(l_Egnd_mantTEX_copy, l_Egnd_mantTEX, sizeof(l_Egnd_mantTEX_copy));
 
-    if(textureObjsInitialized) {
-        GXInitTlutObjData(&tlutObj, l_Egnd_mantPAL); // make sure the cached textures are updated
+        if(textureObjsInitialized) {
+            GXInitTlutObjData(&tlutObj, l_Egnd_mantPAL); // make sure the cached textures are updated
+        }
     }
 
     m_this->mMantRng.init(66, 16983, 855);
